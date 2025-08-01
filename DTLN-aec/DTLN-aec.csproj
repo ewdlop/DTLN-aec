@@ -12,6 +12,10 @@
   <ItemGroup>
     <PackageReference Include="Emgu.TF" Version="2.19.0.1709" />
     <PackageReference Include="Emgu.TF.Lite" Version="2.19.0.1709" />
+    <PackageReference Include="Emgu.TF.Lite.runtime.windows" Version="2.19.0.1709" />
+    <PackageReference Include="Emgu.TF.runtime.windows" Version="2.19.0.1709" />
+    <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.22.1" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="Numpy" Version="3.11.1.35" />
   </ItemGroup>

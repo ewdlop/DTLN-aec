@@ -1,32 +1,32 @@
-﻿using Emgu.TF.Lite;
+﻿using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
 using NAudio.Wave;
 using Numpy;
-using System.Runtime.InteropServices;
 
 namespace DTLN_aec
 {
     public class AudioProcessor : IDisposable
     {
-        private Interpreter _interpreter1;
-        private Interpreter _interpreter2;
+        private InferenceSession _session1;
+        private InferenceSession _session2;
         private const int BlockLength = 512;
         private const int BlockShift = 128;
         private const int SampleRate = 16000;
 
         public AudioProcessor(string modelPath)
         {
-            // Load the two model parts
-            //var model1Bytes = File.ReadAllBytesAsync($"{modelPath}_1.tflite");
-            //var model2Bytes = File.ReadAllBytesAsync($"{modelPath}_2.tflite");
-            //Task.WaitAll(model1Bytes, model2Bytes);
-
-            FlatBufferModel model1 = new FlatBufferModel($"{modelPath}_1.tflite");
-            FlatBufferModel model2 = new FlatBufferModel($"{modelPath}_2.tflite");
-
-            _interpreter1 = new Interpreter(model1);
-            _interpreter1.AllocateTensors();
-            _interpreter2 = new Interpreter(model2);
-            _interpreter2.AllocateTensors();
+            try
+            {
+                // Load the two ONNX model parts
+                var sessionOptions = new SessionOptions();
+                _session1 = new InferenceSession($"{modelPath}_1.onnx", sessionOptions);
+                _session2 = new InferenceSession($"{modelPath}_2.onnx", sessionOptions);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading models: {ex.Message}");
+                throw;
+            }
         }
 
         public void ProcessFile(string audioFileName, string outputFileName)
@@ -39,8 +39,6 @@ namespace DTLN_aec
             // Check sampling rates
             if (fs1 != SampleRate || fs2 != SampleRate)
                 throw new ArgumentException("Sampling rate must be 16kHz.");
-
-            // Check for single channel (already handled in ReadWaveFile)
 
             // Check for unequal length and adjust
             if (lpb.shape[0] > audio.shape[0])
@@ -56,15 +54,17 @@ namespace DTLN_aec
             audio = np.concatenate(new NDarray[] { padding, audio, padding });
             lpb = np.concatenate(new NDarray[] { padding, lpb, padding });
 
-            // Get details from interpreters
-            var inputDetails1 = _interpreter1.Inputs;
-            var outputDetails1 = _interpreter1.Outputs;
-            var inputDetails2 = _interpreter2.Inputs;
-            var outputDetails2 = _interpreter2.Inputs;
+            // Get input/output metadata from sessions
+            var inputMetadata1 = _session1.InputMetadata;
+            var outputMetadata1 = _session1.OutputMetadata;
+            var inputMetadata2 = _session2.InputMetadata;
+            var outputMetadata2 = _session2.OutputMetadata;
 
             // Preallocate states for LSTMs
-            var states1 = np.zeros(GetTensorShape(inputDetails1[1])).astype(np.float32);
-            var states2 = np.zeros(GetTensorShape(inputDetails2[1])).astype(np.float32);
+            var states1Shape = GetTensorShape(inputMetadata1.Values.ElementAt(1));
+            var states2Shape = GetTensorShape(inputMetadata2.Values.ElementAt(1));
+            var states1 = np.zeros(states1Shape).astype(np.float32);
+            var states2 = np.zeros(states2Shape).astype(np.float32);
 
             // Preallocate output file
             var outFile = np.zeros(audio.shape[0]);
@@ -100,21 +100,26 @@ namespace DTLN_aec
                 var lpbMag = np.abs(lpbBlockFft);
                 lpbMag = np.reshape(lpbMag, new int[] { 1, 1, -1 }).astype(np.float32);
 
-                var inMagBytes = inMag.tobytes();
-                var state1Bytes = states1.tobytes();
-                var lpbMagytes = lpbMag.tobytes();
+                // Create input tensors for first model
+                var inputTensors1 = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(inputMetadata1.Keys.ElementAt(0),
+                        CreateTensorFromNDarray(inMag)),
+                    NamedOnnxValue.CreateFromTensor(inputMetadata1.Keys.ElementAt(1),
+                        CreateTensorFromNDarray(states1)),
+                    NamedOnnxValue.CreateFromTensor(inputMetadata1.Keys.ElementAt(2),
+                        CreateTensorFromNDarray(lpbMag))
+                };
 
-                // Set tensors to the first model
-                Marshal.Copy(inMagBytes, 0, _interpreter2.Inputs[0].DataPointer, inMagBytes.Length);
-                Marshal.Copy(state1Bytes, 0, _interpreter2.Inputs[1].DataPointer, state1Bytes.Length);
-                Marshal.Copy(lpbMagytes, 0, _interpreter2.Inputs[2].DataPointer, lpbMagytes.Length);
-
-                // Run calculation
-                _interpreter1.Invoke();
+                // Run first model
+                using var results1 = _session1.Run(inputTensors1);
 
                 // Get the output of the first block
-                var outMask = np.array<float>(_interpreter1.Outputs[0]);
-                states1 = np.array<float>(_interpreter1.Outputs[1]);
+                var outMaskTensor = results1.ElementAt(0).AsTensor<float>();
+                var states1Tensor = results1.ElementAt(1).AsTensor<float>();
+
+                var outMask = TensorToNDarray(outMaskTensor);
+                states1 = TensorToNDarray(states1Tensor);
 
                 // Apply mask and calculate the IFFT
                 var estimatedBlock = np.fft.irfft(inBlockFft * outMask);
@@ -123,20 +128,26 @@ namespace DTLN_aec
                 estimatedBlock = np.reshape(estimatedBlock, new int[] { 1, 1, -1 }).astype(np.float32);
                 var inLpb = np.reshape(inBufferLpb, new int[] { 1, 1, -1 }).astype(np.float32);
 
-                var estimatedBlockBytes = estimatedBlock.tobytes();
-                var states2Bytes = states2.tobytes();
-                var inLpbBytes = inLpb.tobytes();
+                // Create input tensors for second model
+                var inputTensors2 = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(inputMetadata2.Keys.ElementAt(0),
+                        CreateTensorFromNDarray(estimatedBlock)),
+                    NamedOnnxValue.CreateFromTensor(inputMetadata2.Keys.ElementAt(1),
+                        CreateTensorFromNDarray(states2)),
+                    NamedOnnxValue.CreateFromTensor(inputMetadata2.Keys.ElementAt(2),
+                        CreateTensorFromNDarray(inLpb))
+                };
 
-                Marshal.Copy(estimatedBlockBytes, 0, _interpreter2.Inputs[0].DataPointer, estimatedBlockBytes.Length);
-                Marshal.Copy(states2Bytes, 0, _interpreter2.Inputs[1].DataPointer, states2Bytes.Length);
-                Marshal.Copy(inLpbBytes, 0, _interpreter2.Inputs[2].DataPointer, inLpbBytes.Length);
-
-                // Run calculation
-                _interpreter2.Invoke();
+                // Run second model
+                using var results2 = _session2.Run(inputTensors2);
 
                 // Get output tensors
-                var outBlock = np.array<float>(_interpreter2.Outputs[0]);
-                states2 = np.array<float>(_interpreter2.Outputs[1]);
+                var outBlockTensor = results2.ElementAt(0).AsTensor<float>();
+                var states2Tensor = results2.ElementAt(1).AsTensor<float>();
+
+                var outBlock = TensorToNDarray(outBlockTensor);
+                states2 = TensorToNDarray(states2Tensor);
 
                 // Shift values and write to buffer
                 outBuffer[$":-{BlockShift}"] = outBuffer[$"{BlockShift}:"];
@@ -227,16 +238,29 @@ namespace DTLN_aec
             writer.WriteSamples(audio, 0, audio.Length);
         }
 
-        private int[] GetTensorShape(Tensor tensor)
+        private int[] GetTensorShape(NodeMetadata nodeMetadata)
         {
-            // Return the shape array from tensor info
-            return tensor.Dims;
+            return nodeMetadata.Dimensions.ToArray();
+        }
+
+        private Tensor<float> CreateTensorFromNDarray(NDarray ndarray)
+        {
+            var data = ndarray.GetData<float>();
+            var shape = ndarray.shape;
+            return new DenseTensor<float>(memory: data, dimensions: shape.Dimensions);
+        }
+
+        private NDarray TensorToNDarray(Tensor<float> tensor)
+        {
+            var data = tensor.ToArray();
+            var shape = tensor.Dimensions.ToArray();
+            return np.array(data).reshape(shape);
         }
 
         public void Dispose()
         {
-            _interpreter1?.Dispose();
-            _interpreter2?.Dispose();
+            _session1?.Dispose();
+            _session2?.Dispose();
         }
     }
 }
